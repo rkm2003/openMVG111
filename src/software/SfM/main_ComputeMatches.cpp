@@ -17,6 +17,7 @@
 #include "openMVG/matching_image_collection/GeometricFilter.hpp"
 #include "openMVG/sfm/pipelines/sfm_features_provider.hpp"
 #include "openMVG/sfm/pipelines/sfm_regions_provider.hpp"
+#include "openMVG/sfm/pipelines/sfm_preemptive_regions_provider.hpp"
 #include "openMVG/sfm/pipelines/sfm_regions_provider_cache.hpp"
 #include "openMVG/matching_image_collection/F_ACRobust.hpp"
 #include "openMVG/matching_image_collection/E_ACRobust.hpp"
@@ -51,7 +52,8 @@ enum EGeometricModel
   ESSENTIAL_MATRIX   = 1,
   HOMOGRAPHY_MATRIX  = 2,
   ESSENTIAL_MATRIX_ANGULAR = 3,
-  ESSENTIAL_MATRIX_ORTHO = 4
+  ESSENTIAL_MATRIX_ORTHO = 4,
+  MATCHES_COUNT = 5
 };
 
 enum EPairMode
@@ -72,6 +74,7 @@ int main(int argc, char **argv)
 
   std::string sSfM_Data_Filename;
   std::string sMatchesDirectory = "";
+  std::string sOutputPairFile = "pairs.txt";
   std::string sGeometricModel = "f";
   float fDistRatio = 0.8f;
   int iMatchingVideoMode = -1;
@@ -81,6 +84,10 @@ int main(int argc, char **argv)
   bool bGuided_matching = false;
   int imax_iteration = 2048;
   unsigned int ui_max_cache_size = 0;
+
+  // Pre-emptive matching parameters
+  unsigned int ui_preemptive_feature_count = 200;
+  double preemptive_matching_percentage_threshold = 0.08;
 
   //required
   cmd.add( make_option('i', sSfM_Data_Filename, "input_file") );
@@ -95,6 +102,9 @@ int main(int argc, char **argv)
   cmd.add( make_option('m', bGuided_matching, "guided_matching") );
   cmd.add( make_option('I', imax_iteration, "max_iteration") );
   cmd.add( make_option('c', ui_max_cache_size, "cache_size") );
+  // Pre-emptive matching
+  cmd.add( make_option('p', ui_preemptive_feature_count, "preemptive_feature_count") );
+  cmd.add( make_switch('P', "preemptive_matching") );
 
 
   try {
@@ -117,7 +127,7 @@ int main(int argc, char **argv)
       << "   o: orthographic essential matrix.\n"
       << "[-v|--video_mode_matching]\n"
       << "  (sequence matching with an overlap of X images)\n"
-      << "   X: with match 0 with (1->X), ...]\n"
+      << "   X: will match 0 with (1->X), ...]\n"
       << "   2: will match 0 with (1,2), 1 with (2,3), ...\n"
       << "   3: will match 0 with (1,2,3), 1 with (2,3,4), ...\n"
       << "[-l]--pair_list] file\n"
@@ -137,6 +147,9 @@ int main(int argc, char **argv)
       << "[-c|--cache_size]\n"
       << "  Use a regions cache (only cache_size regions will be stored in memory)\n"
       << "  If not used, all regions will be load in memory."
+      << "\n[Pre-emptive matching:]\n"
+      << "[-P|--preemptive_matching] enable pre-emptive matching\n"
+      << "[-p|--preemptive_feature_count] <NUMBER> Number of feature used for pre-emptive matching"
       << std::endl;
 
       std::cerr << s << std::endl;
@@ -155,7 +168,13 @@ int main(int argc, char **argv)
             << "--pair_list " << sPredefinedPairList << "\n"
             << "--nearest_matching_method " << sNearestMatchingMethod << "\n"
             << "--guided_matching " << bGuided_matching << "\n"
-            << "--cache_size " << ((ui_max_cache_size == 0) ? "unlimited" : std::to_string(ui_max_cache_size)) << std::endl;
+            << "--cache_size " << ((ui_max_cache_size == 0) ? "unlimited" : std::to_string(ui_max_cache_size)) << "\n"
+            << "--preemptive_feature_count " << cmd.used('P')
+            << std::endl;
+  if (cmd.used('P'))
+  {
+    std::cout << "--preemptive_feature_count " << ui_preemptive_feature_count << std::endl;
+  }
 
   EPairMode ePairmode = (iMatchingVideoMode == -1 ) ? PAIR_EXHAUSTIVE : PAIR_CONTIGUOUS;
 
@@ -195,6 +214,10 @@ int main(int argc, char **argv)
     case 'o': case 'O':
       eGeometricModelToCompute = ESSENTIAL_MATRIX_ORTHO;
       sGeometricMatchesFilename = "matches.o.bin";
+    break;
+    case 'M':
+      eGeometricModelToCompute = MATCHES_COUNT;
+      sGeometricMatchesFilename = "matches.c.bin";
     break;
     default:
       std::cerr << "Unknown geometric model" << std::endl;
@@ -237,7 +260,6 @@ int main(int argc, char **argv)
   //    - Descriptor matching (according user method choice)
   //    - Keep correspondences only if NearestNeighbor ratio is ok
   //---------------------------------------
-
   // Load the corresponding view regions
   std::shared_ptr<Regions_Provider> regions_provider;
   if (ui_max_cache_size == 0)
@@ -249,6 +271,12 @@ int main(int argc, char **argv)
   {
     // Cached regions provider (load & store regions on demand)
     regions_provider = std::make_shared<Regions_Provider_Cache>(ui_max_cache_size);
+  }
+
+  // If we use pre-emptive matching, we load less regions:
+  if (ui_preemptive_feature_count > 0 && cmd.used('P'))
+  {
+    regions_provider = std::make_shared<Preemptive_Regions_Provider>(ui_preemptive_feature_count);
   }
 
   // Show the progress on the command line:
@@ -268,14 +296,12 @@ int main(int argc, char **argv)
   {
     vec_fileNames.reserve(sfm_data.GetViews().size());
     vec_imagesSize.reserve(sfm_data.GetViews().size());
-    for (Views::const_iterator iter = sfm_data.GetViews().begin();
-      iter != sfm_data.GetViews().end();
-      ++iter)
+    for (const auto view_it : sfm_data.GetViews())
     {
-      const View * v = iter->second.get();
-      vec_fileNames.push_back(stlplus::create_filespec(sfm_data.s_root_path,
+      const View * v = view_it.second.get();
+      vec_fileNames.emplace_back(stlplus::create_filespec(sfm_data.s_root_path,
           v->s_Img_path));
-      vec_imagesSize.push_back( std::make_pair( v->ui_width, v->ui_height) );
+      vec_imagesSize.emplace_back(v->ui_width, v->ui_height);
     }
   }
 
@@ -372,6 +398,7 @@ int main(int argc, char **argv)
           }
           break;
       }
+      std::cout << "Running matching on #pairs: " << pairs.size() << std::endl;
       // Photometric matching of putative pairs
       collectionMatcher->Match(regions_provider, pairs, map_PutativesMatches, &progress);
       //---------------------------------------
@@ -479,6 +506,21 @@ int main(int argc, char **argv)
         map_GeometricMatches = filter_ptr->Get_geometric_matches();
       }
       break;
+      case MATCHES_COUNT:
+      {
+        // Keep putative matches only if there is more than X matches
+        for (const auto & pairwisematches_it : map_PutativesMatches)
+        {
+          const size_t putative_match_count = pairwisematches_it.second.size();
+          const int match_count_threshold =
+            preemptive_matching_percentage_threshold * ui_preemptive_feature_count;
+          if (putative_match_count >= match_count_threshold)  {
+            // the pair will be kept
+            map_GeometricMatches.insert(pairwisematches_it);
+          }
+        }
+      }
+      break;
     }
 
     //---------------------------------------
@@ -493,6 +535,17 @@ int main(int argc, char **argv)
       return EXIT_FAILURE;
     }
 
+    // Save pairs
+    if (!savePairs(
+      std::string(sMatchesDirectory + "/" + sOutputPairFile),
+      getPairs(map_GeometricMatches)))
+    {
+      std::cerr
+          << "Cannot save computed matches pairs in: "
+          << std::string(sMatchesDirectory + "/" + sOutputPairFile);
+      return EXIT_FAILURE;
+    }
+
     std::cout << "Task done in (s): " << timer.elapsed() << std::endl;
 
     //-- export Adjacency matrix
@@ -502,7 +555,7 @@ int main(int argc, char **argv)
       map_GeometricMatches,
       stlplus::create_filespec(sMatchesDirectory, "GeometricAdjacencyMatrix", "svg"));
 
-    //-- export view pair graph once geometric filter have been done
+    //-- export view pair graph once geometric filter has been done
     {
       std::set<IndexT> set_ViewIds;
       std::transform(sfm_data.GetViews().begin(), sfm_data.GetViews().end(),
