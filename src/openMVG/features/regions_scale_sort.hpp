@@ -75,7 +75,10 @@ bool SortAndSelectByRegionScale
 
   // Keep only the regions with the largest scale:
   {
-    const int region_to_keep = (keep_count == -1) ? feats_reordered.size() : keep_count;
+    const int region_to_keep =
+      (keep_count == -1) ?
+        feats_reordered.size() :
+        std::min(keep_count, static_cast<int>(feats_reordered.size()));
 
     auto start_feat_it = std::prev(feats_reordered.end(), region_to_keep);
     feats.assign(start_feat_it, feats_reordered.end());
